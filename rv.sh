@@ -1,58 +1,113 @@
 #!/bin/bash
 
-set -e
+# Variables
+DOMAIN="billing.arialnodes.in"
+DB_NAME="paymenter"
+DB_USER="paymenter"
+DB_PASSWORD="rishabh"
+INSTALL_DIR="/var/www/paymenter"
+PHP_VERSION="8.2"
+MARIADB_VERSION="mariadb-10.11"
 
-DOMAIN="status.arialnodes.in"
-SERVER_IP="178.128.54.237"
-TARGET_PORT="3001"
-TARGET_PATH="/status/uptime"
-EMAIL="forrishabh667@gmail.com"
+# Update and install dependencies
+apt update -y
+apt -y install software-properties-common curl apt-transport-https ca-certificates gnupg
 
-# Function to install required packages
-install_packages() {
-    echo "Installing necessary packages..."
-    sudo apt update && sudo apt install -y nginx certbot python3-certbot-nginx
-}
+# Add PHP repository
+LC_ALL=C.UTF-8 add-apt-repository -y ppa:ondrej/php
 
-# Function to configure Nginx reverse proxy
-setup_nginx() {
-    echo "Setting up Nginx reverse proxy..."
-    
-    # Create Nginx configuration
-    sudo tee /etc/nginx/sites-available/$DOMAIN > /dev/null <<EOL
+# Add MariaDB repository
+curl -LsS https://downloads.mariadb.com/MariaDB/mariadb_repo_setup | sudo bash -s -- --mariadb-server-version="$MARIADB_VERSION"
+
+# Install PHP, MariaDB, Nginx, and other necessary packages
+apt update
+apt -y install php$PHP_VERSION php$PHP_VERSION-{common,cli,gd,mysql,mbstring,bcmath,xml,fpm,curl,zip} mariadb-server nginx tar unzip git redis-server
+
+# Install Composer
+curl -sS https://getcomposer.org/installer | sudo php -- --install-dir=/usr/local/bin --filename=composer
+
+# Set up Paymenter directory
+mkdir -p $INSTALL_DIR
+cd $INSTALL_DIR
+curl -Lo paymenter.tar.gz https://github.com/paymenter/paymenter/releases/latest/download/paymenter.tar.gz
+tar -xzvf paymenter.tar.gz
+chmod -R 755 storage/* bootstrap/cache/
+
+# Set up MariaDB database and user
+mysql -u root -p <<MYSQL_SCRIPT
+CREATE DATABASE $DB_NAME;
+CREATE USER '$DB_USER'@'127.0.0.1' IDENTIFIED BY '$DB_PASSWORD';
+GRANT ALL PRIVILEGES ON $DB_NAME.* TO '$DB_USER'@'127.0.0.1' WITH GRANT OPTION;
+FLUSH PRIVILEGES;
+MYSQL_SCRIPT
+
+# Configure environment
+cp .env.example .env
+sed -i "s/DB_DATABASE=.*/DB_DATABASE=$DB_NAME/" .env
+sed -i "s/DB_USERNAME=.*/DB_USERNAME=$DB_USER/" .env
+sed -i "s/DB_PASSWORD=.*/DB_PASSWORD=$DB_PASSWORD/" .env
+
+# Install PHP dependencies and set application key
+composer install --no-dev --optimize-autoloader
+php artisan key:generate --force
+php artisan storage:link
+
+# Run database migrations and seeders
+php artisan migrate --force --seed
+
+# Create admin user
+php artisan p:user:create
+
+# Configure Nginx
+cat <<NGINX_CONF >/etc/nginx/sites-available/paymenter.conf
 server {
     listen 80;
+    listen [::]:80;
     server_name $DOMAIN;
+    root $INSTALL_DIR/public;
+
+    index index.php;
 
     location / {
-        proxy_pass http://$SERVER_IP:$TARGET_PORT$TARGET_PATH;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
+        try_files \$uri \$uri/ /index.php?\$query_string;
+    }
+
+    location ~ \.php\$ {
+        include snippets/fastcgi-php.conf;
+        fastcgi_pass unix:/var/run/php/php$PHP_VERSION-fpm.sock;
     }
 }
-EOL
+NGINX_CONF
 
-    # Enable the configuration
-    sudo ln -s /etc/nginx/sites-available/$DOMAIN /etc/nginx/sites-enabled/
+# Enable Nginx site and restart service
+ln -s /etc/nginx/sites-available/paymenter.conf /etc/nginx/sites-enabled/
+systemctl restart nginx
 
-    # Restart Nginx
-    sudo systemctl restart nginx
-}
+# Set correct permissions
+chown -R www-data:www-data $INSTALL_DIR/*
 
-# Function to set up SSL with Let's Encrypt
-setup_ssl() {
-    echo "Installing SSL certificate..."
-    sudo certbot --nginx -d $DOMAIN --email $EMAIL --agree-tos --non-interactive
+# Set up cron job for Paymenter
+(crontab -l ; echo "* * * * * php $INSTALL_DIR/artisan schedule:run >> /dev/null 2>&1") | crontab -
 
-    # Auto-renew SSL
-    sudo certbot renew --dry-run
-}
+# Create systemd service for Paymenter queue worker
+cat <<SYSTEMD_CONF >/etc/systemd/system/paymenter.service
+[Unit]
+Description=Paymenter Queue Worker
 
-# Run functions
-install_packages
-setup_nginx
-setup_ssl
+[Service]
+User=www-data
+Group=www-data
+Restart=always
+ExecStart=/usr/bin/php $INSTALL_DIR/artisan queue:work
+StartLimitInterval=180
+StartLimitBurst=30
+RestartSec=5s
 
-echo "Reverse proxy setup complete! Visit: https://$DOMAIN"
+[Install]
+WantedBy=multi-user.target
+SYSTEMD_CONF
+
+# Enable and start the Paymenter queue worker service
+systemctl enable --now paymenter.service
+
+echo "Paymenter installation is complete. Please visit http://$DOMAIN to access your Paymenter instance."
